@@ -4,16 +4,20 @@ using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace Sing_box_UI
 {
     internal sealed class LogViewerForm : Form
     {
-        private const int EmGetFirstVisibleLine = 0x00CE;
-        private const int EmLineScroll = 0x00B6;
         private const int WmSetRedraw = 0x000B;
+        private const int EmGetScrollPos = 0x04DD;
+        private const int EmSetScrollPos = 0x04DE;
+        private const int SbVert = 1;
+        private const uint SifAll = 0x17;
         private static readonly Regex SeverityRegex = new Regex(@"\b(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         private readonly string _logPath;
@@ -29,6 +33,9 @@ namespace Sing_box_UI
         private readonly Timer _refreshTimer;
 
         private long _lastReadPosition;
+        private bool _isInitialLoadInProgress;
+        private bool _followTail;
+        private bool _suspendViewTracking;
         private string _activeSearchQuery;
         private List<int> _searchMatchPositions = new List<int>();
         private int _currentSearchMatchIndex = -1;
@@ -59,6 +66,10 @@ namespace Sing_box_UI
                 BorderStyle = BorderStyle.FixedSingle,
                 Font = new Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point)
             };
+            _logTextBox.VScroll += (_, __) => HandleUserViewportInteraction();
+            _logTextBox.MouseWheel += (_, __) => HandleUserViewportInteraction();
+            _logTextBox.MouseUp += (_, __) => HandleUserViewportInteraction();
+            _logTextBox.KeyUp += (_, __) => HandleUserViewportInteraction();
 
             _findInLogsLabel = new Label
             {
@@ -163,9 +174,9 @@ namespace Sing_box_UI
 
             Shown += (_, __) =>
             {
-                RefreshLogContents();
                 ActiveControl = _closeButton;
-                _refreshTimer.Start();
+                _logTextBox.Text = "Loading logs...";
+                BeginInvoke(new Action(async () => await LoadInitialLogAsync()));
             };
 
             Activated += (_, __) => ClearFullTextSelectionIfNeeded();
@@ -183,6 +194,7 @@ namespace Sing_box_UI
                 _refreshTimer.Dispose();
                 PerformWithoutRedraw(() => _logTextBox.Clear());
                 _lastReadPosition = 0;
+                _followTail = false;
                 _searchMatchPositions.Clear();
                 _activeSearchQuery = null;
                 _currentSearchMatchIndex = -1;
@@ -193,19 +205,21 @@ namespace Sing_box_UI
 
         private void RefreshLogContents()
         {
+            if (_isInitialLoadInProgress)
+            {
+                return;
+            }
+
             var appendResult = ReadLogDeltaSafe();
             if (!appendResult.HasChanges)
             {
                 return;
             }
 
-            var previousFirstVisibleLine = GetFirstVisibleLine();
-            var previousLineCount = Math.Max(1, _logTextBox.Lines.Length);
-            var visibleLineCount = GetVisibleLineCount();
+            var previousScrollPosition = GetScrollPosition();
             var previousSelectionStart = _logTextBox.SelectionStart;
             var previousSelectionLength = _logTextBox.SelectionLength;
-            var shouldScrollToEnd = previousSelectionLength == 0 &&
-                previousFirstVisibleLine + visibleLineCount >= previousLineCount - 1;
+            var shouldScrollToEnd = _followTail;
 
             PerformWithoutRedraw(() =>
             {
@@ -232,9 +246,70 @@ namespace Sing_box_UI
                     return;
                 }
 
-                RestoreFirstVisibleLine(previousFirstVisibleLine);
-                RestoreSelection(previousSelectionStart, previousSelectionLength);
+                if (previousSelectionLength > 0)
+                {
+                    RestoreSelection(previousSelectionStart, previousSelectionLength);
+                }
+
+                RestoreScrollPosition(previousScrollPosition);
             });
+        }
+
+        private async Task LoadInitialLogAsync()
+        {
+            if (_isInitialLoadInProgress)
+            {
+                return;
+            }
+
+            _isInitialLoadInProgress = true;
+            _refreshTimer.Stop();
+
+            try
+            {
+                var snapshot = await ReadEntireLogSnapshotSafeAsync();
+                if (IsDisposed || Disposing)
+                {
+                    return;
+                }
+
+                _lastReadPosition = snapshot.Length;
+                var renderedRtf = await Task.Run(() => BuildStyledLogRtf(snapshot.Content));
+                if (IsDisposed || Disposing)
+                {
+                    return;
+                }
+
+                PerformWithoutRedraw(() =>
+                {
+                    if (string.IsNullOrEmpty(snapshot.Content))
+                    {
+                        _logTextBox.Clear();
+                    }
+                    else
+                    {
+                        _logTextBox.Rtf = renderedRtf;
+                    }
+
+                    _logTextBox.SelectionStart = 0;
+                    _logTextBox.SelectionLength = 0;
+                });
+                _followTail = IsScrolledToBottom();
+
+                if (!string.IsNullOrWhiteSpace(_activeSearchQuery))
+                {
+                    RefreshSearchMatches(false, -1, 0);
+                }
+            }
+            finally
+            {
+                _isInitialLoadInProgress = false;
+
+                if (!IsDisposed && !Disposing)
+                {
+                    _refreshTimer.Start();
+                }
+            }
         }
 
         private LogAppendResult ReadLogDeltaSafe()
@@ -272,6 +347,31 @@ namespace Sing_box_UI
                 _lastReadPosition = 0;
                 return new LogAppendResult(true, true, "Failed to read log file." + Environment.NewLine + ex.Message);
             }
+        }
+
+        private Task<LogSnapshot> ReadEntireLogSnapshotSafeAsync()
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    if (!File.Exists(_logPath))
+                    {
+                        return new LogSnapshot(string.Empty, 0);
+                    }
+
+                    using (var stream = new FileStream(_logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    using (var reader = new StreamReader(stream))
+                    {
+                        var content = reader.ReadToEnd();
+                        return new LogSnapshot(content, stream.Length);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    return new LogSnapshot("Failed to read log file." + Environment.NewLine + ex.Message, 0);
+                }
+            });
         }
 
         private void ShowLogFileInExplorer()
@@ -324,32 +424,26 @@ namespace Sing_box_UI
             }
         }
 
-        private int GetFirstVisibleLine()
+        private bool IsScrolledToBottom()
         {
-            return SendMessage(_logTextBox.Handle, EmGetFirstVisibleLine, IntPtr.Zero, IntPtr.Zero).ToInt32();
-        }
-
-        private int GetVisibleLineCount()
-        {
-            var fontHeight = Math.Max(1, _logTextBox.Font.Height);
-            return Math.Max(1, _logTextBox.ClientSize.Height / fontHeight);
-        }
-
-        private void RestoreFirstVisibleLine(int firstVisibleLine)
-        {
-            if (firstVisibleLine < 0)
+            if (!_logTextBox.IsHandleCreated)
             {
-                return;
+                return false;
             }
 
-            var currentFirstVisibleLine = GetFirstVisibleLine();
-            var delta = firstVisibleLine - currentFirstVisibleLine;
-            if (delta == 0)
+            var scrollInfo = new ScrollInfo
             {
-                return;
+                cbSize = (uint)Marshal.SizeOf(typeof(ScrollInfo)),
+                fMask = SifAll
+            };
+
+            if (!GetScrollInfo(_logTextBox.Handle, SbVert, ref scrollInfo))
+            {
+                return false;
             }
 
-            SendMessage(_logTextBox.Handle, EmLineScroll, IntPtr.Zero, new IntPtr(delta));
+            var bottomPosition = scrollInfo.nPos + (int)Math.Max(scrollInfo.nPage, 1u);
+            return bottomPosition >= scrollInfo.nMax;
         }
 
         private void ClearFullTextSelectionIfNeeded()
@@ -363,6 +457,29 @@ namespace Sing_box_UI
             {
                 _logTextBox.SelectionLength = 0;
             }
+        }
+
+        private void UpdateFollowTailFromCurrentView()
+        {
+            if (_isInitialLoadInProgress || !_logTextBox.IsHandleCreated || _suspendViewTracking)
+            {
+                return;
+            }
+
+            _followTail = _logTextBox.SelectionLength == 0 && IsScrolledToBottom();
+        }
+
+        private void HandleUserViewportInteraction()
+        {
+            if (_isInitialLoadInProgress || !_logTextBox.IsHandleCreated || _suspendViewTracking)
+            {
+                return;
+            }
+
+            // Any user-driven viewport movement should immediately disable tail-following.
+            // If the user actually lands on the very last line, we re-enable it on the next UI turn.
+            _followTail = false;
+            BeginInvoke(new Action(UpdateFollowTailFromCurrentView));
         }
 
         private void FindTextBoxKeyDown(object sender, KeyEventArgs e)
@@ -453,6 +570,7 @@ namespace Sing_box_UI
             _logTextBox.SelectionLength = queryLength;
             _logTextBox.ScrollToCaret();
             _logTextBox.Focus();
+            _followTail = false;
 
             UpdateOccurrencesLabel();
         }
@@ -596,6 +714,143 @@ namespace Sing_box_UI
             }
         }
 
+        private static string BuildStyledLogRtf(string content)
+        {
+            if (string.IsNullOrEmpty(content))
+            {
+                return null;
+            }
+
+            var colorTable = new[]
+            {
+                Color.Black,
+                SystemColors.WindowText,
+                SystemColors.Window,
+                Color.FromArgb(103, 92, 120),
+                Color.FromArgb(244, 241, 248),
+                Color.FromArgb(58, 78, 108),
+                Color.FromArgb(232, 239, 250),
+                Color.FromArgb(35, 102, 78),
+                Color.FromArgb(232, 247, 239),
+                Color.FromArgb(122, 90, 31),
+                Color.FromArgb(252, 247, 228),
+                Color.FromArgb(104, 47, 34),
+                Color.FromArgb(251, 236, 232),
+                Color.FromArgb(92, 28, 28),
+                Color.FromArgb(247, 224, 224)
+            };
+
+            var builder = new StringBuilder(content.Length + 1024);
+            builder.Append(@"{\rtf1\ansi\ansicpg1251\deff0");
+            builder.Append(@"{\fonttbl{\f0\fmodern Consolas;}}");
+            builder.Append(@"{\colortbl ;");
+
+            foreach (var color in colorTable)
+            {
+                builder.Append(@"\red").Append(color.R)
+                    .Append(@"\green").Append(color.G)
+                    .Append(@"\blue").Append(color.B)
+                    .Append(';');
+            }
+
+            builder.Append('}');
+            builder.Append(@"\fs18");
+
+            var normalizedContent = content.Replace("\r\n", "\n").Replace('\r', '\n');
+            var lineStart = 0;
+
+            for (var index = 0; index <= normalizedContent.Length; index++)
+            {
+                var isLineBreak = index == normalizedContent.Length || normalizedContent[index] == '\n';
+                if (!isLineBreak)
+                {
+                    continue;
+                }
+
+                var lineText = normalizedContent.Substring(lineStart, index - lineStart);
+                var lineStyle = ResolveSeverityStyle(lineText);
+                if (lineStyle == null)
+                {
+                    builder.Append(@"\cf2\highlight3 ");
+                }
+                else
+                {
+                    builder.Append(@"\cf").Append(GetForegroundColorIndex(lineStyle))
+                        .Append(@"\highlight").Append(GetBackgroundColorIndex(lineStyle))
+                        .Append(' ');
+                }
+
+                builder.Append(EscapeRtfText(lineText));
+                if (index < normalizedContent.Length)
+                {
+                    builder.Append(@"\par ");
+                }
+
+                lineStart = index + 1;
+            }
+
+            builder.Append('}');
+            return builder.ToString();
+        }
+
+        private static int GetForegroundColorIndex(SeverityStyle style)
+        {
+            if (style.ForegroundColor == Color.FromArgb(103, 92, 120)) return 4;
+            if (style.ForegroundColor == Color.FromArgb(58, 78, 108)) return 6;
+            if (style.ForegroundColor == Color.FromArgb(35, 102, 78)) return 8;
+            if (style.ForegroundColor == Color.FromArgb(122, 90, 31)) return 10;
+            if (style.ForegroundColor == Color.FromArgb(104, 47, 34)) return 12;
+            if (style.ForegroundColor == Color.FromArgb(92, 28, 28)) return 14;
+            return 2;
+        }
+
+        private static int GetBackgroundColorIndex(SeverityStyle style)
+        {
+            if (style.BackgroundColor == Color.FromArgb(244, 241, 248)) return 5;
+            if (style.BackgroundColor == Color.FromArgb(232, 239, 250)) return 7;
+            if (style.BackgroundColor == Color.FromArgb(232, 247, 239)) return 9;
+            if (style.BackgroundColor == Color.FromArgb(252, 247, 228)) return 11;
+            if (style.BackgroundColor == Color.FromArgb(251, 236, 232)) return 13;
+            if (style.BackgroundColor == Color.FromArgb(247, 224, 224)) return 15;
+            return 3;
+        }
+
+        private static string EscapeRtfText(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return string.Empty;
+            }
+
+            var builder = new StringBuilder(text.Length * 2);
+            foreach (var character in text)
+            {
+                switch (character)
+                {
+                    case '\\':
+                    case '{':
+                    case '}':
+                        builder.Append('\\').Append(character);
+                        break;
+                    case '\t':
+                        builder.Append(@"\tab ");
+                        break;
+                    default:
+                        if (character <= 0x7f)
+                        {
+                            builder.Append(character);
+                        }
+                        else
+                        {
+                            builder.Append(@"\u").Append((short)character).Append('?');
+                        }
+                        break;
+                }
+            }
+
+            return builder.ToString();
+        }
+
         private void PerformWithoutRedraw(Action action)
         {
             if (action == null)
@@ -609,6 +864,7 @@ namespace Sing_box_UI
                 return;
             }
 
+            _suspendViewTracking = true;
             SendMessage(_logTextBox.Handle, WmSetRedraw, IntPtr.Zero, IntPtr.Zero);
 
             try
@@ -620,11 +876,31 @@ namespace Sing_box_UI
                 SendMessage(_logTextBox.Handle, WmSetRedraw, new IntPtr(1), IntPtr.Zero);
                 _logTextBox.Invalidate();
                 _logTextBox.Update();
+                _suspendViewTracking = false;
             }
+        }
+
+        private NativePoint GetScrollPosition()
+        {
+            var position = new NativePoint();
+            SendMessage(_logTextBox.Handle, EmGetScrollPos, IntPtr.Zero, ref position);
+            return position;
+        }
+
+        private void RestoreScrollPosition(NativePoint position)
+        {
+            SendMessage(_logTextBox.Handle, EmSetScrollPos, IntPtr.Zero, ref position);
         }
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, ref NativePoint point);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetScrollInfo(IntPtr hwnd, int fnBar, ref ScrollInfo lpsi);
 
         private sealed class LogAppendResult
         {
@@ -640,6 +916,45 @@ namespace Sing_box_UI
             public bool ResetExistingContent { get; }
 
             public string NewContent { get; }
+        }
+
+        private sealed class LogSnapshot
+        {
+            public LogSnapshot(string content, long length)
+            {
+                Content = content ?? string.Empty;
+                Length = length;
+            }
+
+            public string Content { get; }
+
+            public long Length { get; }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativePoint
+        {
+            public int X;
+
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ScrollInfo
+        {
+            public uint cbSize;
+
+            public uint fMask;
+
+            public int nMin;
+
+            public int nMax;
+
+            public uint nPage;
+
+            public int nPos;
+
+            public int nTrackPos;
         }
 
         private sealed class SeverityStyle

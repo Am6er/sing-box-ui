@@ -21,11 +21,13 @@ namespace Sing_box_UI
         private UpdateAvailableDialog(string currentVersion, string latestVersion, string releaseNotes)
         {
             Text = "New version sing-box available";
-            FormBorderStyle = FormBorderStyle.FixedDialog;
+            Icon = FormIconHelper.LoadApplicationIcon();
+            FormBorderStyle = FormBorderStyle.Sizable;
             StartPosition = FormStartPosition.CenterScreen;
-            MaximizeBox = false;
+            MaximizeBox = true;
             MinimizeBox = false;
             ShowInTaskbar = false;
+            MinimumSize = new Size(720, 520);
             ClientSize = new Size(720, 520);
 
             var summaryLabel = new Label
@@ -35,6 +37,7 @@ namespace Sing_box_UI
                 Top = 12,
                 Width = 696,
                 Height = 64,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
                 Text = "Current sing-box version: " + currentVersion + Environment.NewLine +
                        "Latest version: " + latestVersion + Environment.NewLine +
                        "Installing the update will restart sing-box."
@@ -45,6 +48,7 @@ namespace Sing_box_UI
                 AutoSize = true,
                 Left = 12,
                 Top = 82,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left,
                 Text = "Release Notes"
             };
 
@@ -54,6 +58,7 @@ namespace Sing_box_UI
                 Top = 104,
                 Width = 696,
                 Height = 344,
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 Multiline = true,
                 ScrollBars = ScrollBars.Vertical,
                 ReadOnly = true,
@@ -65,6 +70,7 @@ namespace Sing_box_UI
                 Left = 12,
                 Top = 464,
                 Width = 140,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
                 Text = "Open in browser"
             };
             _openInBrowserButton.Click += (_, __) =>
@@ -79,6 +85,7 @@ namespace Sing_box_UI
                 Left = 160,
                 Top = 464,
                 Width = 160,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
                 Text = "Install and restart"
             };
             _installButton.Click += (_, __) =>
@@ -93,6 +100,7 @@ namespace Sing_box_UI
                 Left = 608,
                 Top = 464,
                 Width = 100,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
                 Text = "Close",
                 DialogResult = DialogResult.Cancel
             };
@@ -138,6 +146,7 @@ namespace Sing_box_UI
         public DownloadProgressDialog()
         {
             Text = "Installing sing-box update";
+            Icon = FormIconHelper.LoadApplicationIcon();
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterScreen;
             MaximizeBox = false;
@@ -319,6 +328,7 @@ namespace Sing_box_UI
         public TimedOperationDialog(string caption)
         {
             Text = caption;
+            Icon = FormIconHelper.LoadApplicationIcon();
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterScreen;
             MaximizeBox = false;

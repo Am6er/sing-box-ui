@@ -3,9 +3,12 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Globalization;
 using System.Linq;
 using System.Management;
 using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -14,9 +17,13 @@ namespace Sing_box_UI
 {
     internal sealed class TrayApplicationContext : ApplicationContext
     {
+        private static readonly Regex AnsiEscapeSequenceRegex = new Regex(@"\x1B\[[0-9;?]*[ -/]*[@-~]", RegexOptions.Compiled);
+
         private readonly string _workingDirectory;
         private readonly string _settingsPath;
         private readonly string _singBoxPath;
+        private readonly string _logPath;
+        private readonly object _logSync = new object();
         private readonly ContextMenuStrip _contextMenu;
         private readonly ToolStripLabel _statusLabel;
         private readonly ToolStripMenuItem _startMenuItem;
@@ -24,6 +31,7 @@ namespace Sing_box_UI
         private readonly ToolStripMenuItem _restartMenuItem;
         private readonly ToolStripMenuItem _exitMenuItem;
         private readonly ToolStripMenuItem _settingsMenuItem;
+        private readonly ToolStripMenuItem _showLogsMenuItem;
         private readonly ToolStripMenuItem _selectConfigFileMenuItem;
         private readonly ToolStripMenuItem _checkUpdatesMenuItem;
         private readonly ToolStripMenuItem _currentVersionMenuItem;
@@ -34,6 +42,8 @@ namespace Sing_box_UI
 
         private int? _managedProcessId;
         private DateTime? _managedProcessStartedAtUtc;
+        private Process _managedProcessHandle;
+        private int _activeLogSessionId;
         private string _lastStatusMessage;
         private bool _isExiting;
 
@@ -42,6 +52,7 @@ namespace Sing_box_UI
             _workingDirectory = Application.StartupPath;
             _settingsPath = Path.Combine(_workingDirectory, "settings.ini");
             _singBoxPath = Path.Combine(_workingDirectory, "sing-box.exe");
+            _logPath = Path.Combine(_workingDirectory, "sing-box.log");
             _settings = new AppSettings(_settingsPath);
             _settings.Load();
             _settings.Save();
@@ -59,6 +70,7 @@ namespace Sing_box_UI
             _stopMenuItem = new ToolStripMenuItem("Stop", null, (_, __) => StopFromMenu());
             _restartMenuItem = new ToolStripMenuItem("Restart", null, (_, __) => RestartFromMenu());
             _exitMenuItem = new ToolStripMenuItem("Exit", null, (_, __) => ExitApplication());
+            _showLogsMenuItem = new ToolStripMenuItem("Show logs", null, (_, __) => ShowLogsFromMenu());
             _selectConfigFileMenuItem = new ToolStripMenuItem("Select config file", null, (_, __) => SelectConfigFileFromMenu());
             _checkUpdatesMenuItem = new ToolStripMenuItem("Check sing-box updates", null, async (_, __) => await CheckSingBoxUpdatesAsync());
             _currentVersionMenuItem = new ToolStripMenuItem("Current sing-box version: loading...")
@@ -84,6 +96,7 @@ namespace Sing_box_UI
                 _restartMenuItem,
                 new ToolStripSeparator(),
                 _settingsMenuItem,
+                _showLogsMenuItem,
                 new ToolStripSeparator(),
                 _exitMenuItem
             });
@@ -123,6 +136,7 @@ namespace Sing_box_UI
             _isExiting = true;
             _statusTimer.Stop();
             StopManagedProcess();
+            DisposeManagedProcessHandle();
 
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
@@ -179,6 +193,14 @@ namespace Sing_box_UI
         private void ExitApplication()
         {
             ExitThread();
+        }
+
+        private void ShowLogsFromMenu()
+        {
+            using (var dialog = new LogViewerForm(_logPath))
+            {
+                dialog.ShowDialog();
+            }
         }
 
         private void SelectConfigFileFromMenu()
@@ -531,6 +553,10 @@ namespace Sing_box_UI
                     Arguments = "run -c \"" + Path.GetFileName(configPath) + "\"",
                     WorkingDirectory = _workingDirectory,
                     UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = new UTF8Encoding(false),
+                    StandardErrorEncoding = new UTF8Encoding(false),
                     CreateNoWindow = true,
                     WindowStyle = ProcessWindowStyle.Hidden
                 });
@@ -543,17 +569,29 @@ namespace Sing_box_UI
                     return false;
                 }
 
-                using (process)
-                {
-                    _managedProcessId = process.Id;
-                    _managedProcessStartedAtUtc = process.StartTime.ToUniversalTime();
-                    _lastStatusMessage = "Started (PID " + process.Id + ")";
-                }
+                var logSessionId = Interlocked.Increment(ref _activeLogSessionId);
+
+                process.EnableRaisingEvents = true;
+                process.OutputDataReceived += (_, eventArgs) => AppendProcessOutputLine(logSessionId, "stdout", eventArgs.Data);
+                process.ErrorDataReceived += (_, eventArgs) => AppendProcessOutputLine(logSessionId, "stderr", eventArgs.Data);
+                process.Exited += (_, __) => HandleManagedProcessExited(process, logSessionId);
+
+                ResetLogFile();
+
+                _managedProcessId = process.Id;
+                _managedProcessStartedAtUtc = process.StartTime.ToUniversalTime();
+                _managedProcessHandle = process;
+                _lastStatusMessage = "Started (PID " + process.Id + ")";
+
+                AppendLogLine("Sing-box process started with PID " + process.Id);
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
 
                 return true;
             }
             catch (Exception ex)
             {
+                DisposeManagedProcessHandle();
                 _managedProcessId = null;
                 _managedProcessStartedAtUtc = null;
                 _lastStatusMessage = "Start error: " + ex.Message;
@@ -913,6 +951,7 @@ namespace Sing_box_UI
                 _stopMenuItem,
                 _restartMenuItem,
                 _settingsMenuItem,
+                _showLogsMenuItem,
                 _exitMenuItem,
                 _currentVersionMenuItem
             };
@@ -982,6 +1021,90 @@ namespace Sing_box_UI
             {
                 return "unknown";
             }
+        }
+
+        private void ResetLogFile()
+        {
+            lock (_logSync)
+            {
+                File.WriteAllText(_logPath, string.Empty);
+            }
+        }
+
+        private void AppendProcessOutputLine(int logSessionId, string streamName, string line)
+        {
+            if (string.IsNullOrWhiteSpace(line) || logSessionId != _activeLogSessionId)
+            {
+                return;
+            }
+
+            var sanitizedLine = SanitizeProcessOutput(line);
+            if (string.IsNullOrWhiteSpace(sanitizedLine))
+            {
+                return;
+            }
+
+            AppendLogLine("[" + streamName + "] " + sanitizedLine);
+        }
+
+        private void HandleManagedProcessExited(Process process, int logSessionId)
+        {
+            try
+            {
+                if (logSessionId == _activeLogSessionId)
+                {
+                    AppendLogLine("Sing-box process PID " + process.Id + " was stopped");
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                if (ReferenceEquals(_managedProcessHandle, process))
+                {
+                    _managedProcessHandle = null;
+                }
+
+                process.Dispose();
+            }
+        }
+
+        private void DisposeManagedProcessHandle()
+        {
+            var process = _managedProcessHandle;
+            _managedProcessHandle = null;
+
+            if (process == null)
+            {
+                return;
+            }
+
+            try
+            {
+                process.Dispose();
+            }
+            catch
+            {
+            }
+        }
+
+        private void AppendLogLine(string message)
+        {
+            var entry = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " " + message + Environment.NewLine;
+
+            lock (_logSync)
+            {
+                File.AppendAllText(_logPath, entry);
+            }
+        }
+
+        private static string SanitizeProcessOutput(string line)
+        {
+            var cleanedLine = line ?? string.Empty;
+            cleanedLine = cleanedLine.Replace("\uFEFF", string.Empty);
+            cleanedLine = AnsiEscapeSequenceRegex.Replace(cleanedLine, string.Empty);
+            return cleanedLine.TrimEnd();
         }
 
         private ManagedProcessCandidate[] FindManagedProcessCandidates()

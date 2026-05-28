@@ -21,6 +21,8 @@ namespace Sing_box_UI
         private static readonly Regex SeverityRegex = new Regex(@"\b(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         private readonly string _logPath;
+        private readonly Label _severityFilterLabel;
+        private readonly ComboBox _severityFilterComboBox;
         private readonly RichTextBox _logTextBox;
         private readonly Label _findInLogsLabel;
         private readonly TextBox _findTextBox;
@@ -51,12 +53,43 @@ namespace Sing_box_UI
             MinimumSize = new Size(760, 480);
             ClientSize = new Size(860, 560);
 
+            _severityFilterLabel = new Label
+            {
+                Left = 12,
+                Top = 14,
+                Width = 104,
+                Height = 24,
+                Anchor = AnchorStyles.Left | AnchorStyles.Top,
+                Text = "Log severity level:"
+            };
+
+            _severityFilterComboBox = new ComboBox
+            {
+                Left = 122,
+                Top = 10,
+                Width = 180,
+                Height = 24,
+                Anchor = AnchorStyles.Left | AnchorStyles.Top,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            _severityFilterComboBox.Items.AddRange(new object[]
+            {
+                new SeverityFilterOption("Default", null),
+                new SeverityFilterOption("Trace", 0),
+                new SeverityFilterOption("Debug", 1),
+                new SeverityFilterOption("Info", 2),
+                new SeverityFilterOption("Warn", 3),
+                new SeverityFilterOption("Error", 4),
+                new SeverityFilterOption("Fatal", 5)
+            });
+            _severityFilterComboBox.SelectedIndex = 0;
+
             _logTextBox = new RichTextBox
             {
                 Left = 12,
-                Top = 12,
+                Top = 44,
                 Width = 836,
-                Height = 456,
+                Height = 424,
                 Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 ReadOnly = true,
                 ScrollBars = RichTextBoxScrollBars.Vertical,
@@ -70,6 +103,7 @@ namespace Sing_box_UI
             _logTextBox.MouseWheel += (_, __) => HandleUserViewportInteraction();
             _logTextBox.MouseUp += (_, __) => HandleUserViewportInteraction();
             _logTextBox.KeyUp += (_, __) => HandleUserViewportInteraction();
+            _severityFilterComboBox.SelectedIndexChanged += async (_, __) => await ReloadVisibleLogFromFileAsync();
 
             _findInLogsLabel = new Label
             {
@@ -154,6 +188,8 @@ namespace Sing_box_UI
             };
             _closeButton.Click += (_, __) => Close();
 
+            Controls.Add(_severityFilterLabel);
+            Controls.Add(_severityFilterComboBox);
             Controls.Add(_logTextBox);
             Controls.Add(_findInLogsLabel);
             Controls.Add(_findTextBox);
@@ -216,6 +252,12 @@ namespace Sing_box_UI
                 return;
             }
 
+            var filteredNewContent = ApplySeverityFilter(appendResult.NewContent);
+            if (!appendResult.ResetExistingContent && string.IsNullOrEmpty(filteredNewContent))
+            {
+                return;
+            }
+
             var previousScrollPosition = GetScrollPosition();
             var previousSelectionStart = _logTextBox.SelectionStart;
             var previousSelectionLength = _logTextBox.SelectionLength;
@@ -228,9 +270,9 @@ namespace Sing_box_UI
                     _logTextBox.Clear();
                 }
 
-                if (!string.IsNullOrEmpty(appendResult.NewContent))
+                if (!string.IsNullOrEmpty(filteredNewContent))
                 {
-                    AppendStyledLogContent(appendResult.NewContent);
+                    AppendStyledLogContent(filteredNewContent);
                 }
 
                 if (!string.IsNullOrWhiteSpace(_activeSearchQuery))
@@ -257,59 +299,7 @@ namespace Sing_box_UI
 
         private async Task LoadInitialLogAsync()
         {
-            if (_isInitialLoadInProgress)
-            {
-                return;
-            }
-
-            _isInitialLoadInProgress = true;
-            _refreshTimer.Stop();
-
-            try
-            {
-                var snapshot = await ReadEntireLogSnapshotSafeAsync();
-                if (IsDisposed || Disposing)
-                {
-                    return;
-                }
-
-                _lastReadPosition = snapshot.Length;
-                var renderedRtf = await Task.Run(() => BuildStyledLogRtf(snapshot.Content));
-                if (IsDisposed || Disposing)
-                {
-                    return;
-                }
-
-                PerformWithoutRedraw(() =>
-                {
-                    if (string.IsNullOrEmpty(snapshot.Content))
-                    {
-                        _logTextBox.Clear();
-                    }
-                    else
-                    {
-                        _logTextBox.Rtf = renderedRtf;
-                    }
-
-                    _logTextBox.SelectionStart = 0;
-                    _logTextBox.SelectionLength = 0;
-                });
-                _followTail = IsScrolledToBottom();
-
-                if (!string.IsNullOrWhiteSpace(_activeSearchQuery))
-                {
-                    RefreshSearchMatches(false, -1, 0);
-                }
-            }
-            finally
-            {
-                _isInitialLoadInProgress = false;
-
-                if (!IsDisposed && !Disposing)
-                {
-                    _refreshTimer.Start();
-                }
-            }
+            await ReloadVisibleLogFromFileAsync();
         }
 
         private LogAppendResult ReadLogDeltaSafe()
@@ -372,6 +362,68 @@ namespace Sing_box_UI
                     return new LogSnapshot("Failed to read log file." + Environment.NewLine + ex.Message, 0);
                 }
             });
+        }
+
+        private async Task ReloadVisibleLogFromFileAsync()
+        {
+            if (_isInitialLoadInProgress)
+            {
+                return;
+            }
+
+            _isInitialLoadInProgress = true;
+            _refreshTimer.Stop();
+
+            try
+            {
+                var snapshot = await ReadEntireLogSnapshotSafeAsync();
+                var renderedSnapshot = await Task.Run(() =>
+                {
+                    var filteredContent = ApplySeverityFilter(snapshot.Content);
+                    return new RenderedLogSnapshot(
+                        filteredContent,
+                        BuildStyledLogRtf(filteredContent),
+                        snapshot.Length);
+                });
+
+                if (IsDisposed || Disposing)
+                {
+                    return;
+                }
+
+                _lastReadPosition = renderedSnapshot.SourceLength;
+
+                PerformWithoutRedraw(() =>
+                {
+                    if (string.IsNullOrEmpty(renderedSnapshot.FilteredContent))
+                    {
+                        _logTextBox.Clear();
+                    }
+                    else
+                    {
+                        _logTextBox.Rtf = renderedSnapshot.RenderedRtf;
+                    }
+
+                    _logTextBox.SelectionStart = 0;
+                    _logTextBox.SelectionLength = 0;
+                });
+
+                _followTail = IsScrolledToBottom();
+
+                if (!string.IsNullOrWhiteSpace(_activeSearchQuery))
+                {
+                    RefreshSearchMatches(false, -1, 0);
+                }
+            }
+            finally
+            {
+                _isInitialLoadInProgress = false;
+
+                if (!IsDisposed && !Disposing)
+                {
+                    _refreshTimer.Start();
+                }
+            }
         }
 
         private void ShowLogFileInExplorer()
@@ -595,6 +647,89 @@ namespace Sing_box_UI
         {
             var currentOccurrence = _currentSearchMatchIndex >= 0 ? _currentSearchMatchIndex + 1 : 0;
             _occurrencesLabel.Text = "Number of occurences: " + currentOccurrence + "/" + _searchMatchPositions.Count;
+        }
+
+        private string ApplySeverityFilter(string content)
+        {
+            if (string.IsNullOrEmpty(content))
+            {
+                return string.Empty;
+            }
+
+            var minimumSeverity = GetSelectedMinimumSeverity();
+            if (!minimumSeverity.HasValue)
+            {
+                return content;
+            }
+
+            var normalizedContent = content.Replace("\r\n", "\n").Replace('\r', '\n');
+            var builder = new StringBuilder(normalizedContent.Length);
+            var lineStart = 0;
+
+            for (var index = 0; index <= normalizedContent.Length; index++)
+            {
+                var isLineBreak = index == normalizedContent.Length || normalizedContent[index] == '\n';
+                if (!isLineBreak)
+                {
+                    continue;
+                }
+
+                var lineText = normalizedContent.Substring(lineStart, index - lineStart);
+                if (TryGetSeverityRank(lineText, out var severityRank) && severityRank >= minimumSeverity.Value)
+                {
+                    builder.Append(lineText);
+                    if (index < normalizedContent.Length)
+                    {
+                        builder.Append(Environment.NewLine);
+                    }
+                }
+
+                lineStart = index + 1;
+            }
+
+            return builder.ToString();
+        }
+
+        private int? GetSelectedMinimumSeverity()
+        {
+            var selectedOption = _severityFilterComboBox.SelectedItem as SeverityFilterOption;
+            return selectedOption?.MinimumSeverityRank;
+        }
+
+        private static bool TryGetSeverityRank(string lineText, out int severityRank)
+        {
+            severityRank = -1;
+
+            var severityMatch = SeverityRegex.Match(lineText ?? string.Empty);
+            if (!severityMatch.Success)
+            {
+                return false;
+            }
+
+            switch (severityMatch.Value.ToUpperInvariant())
+            {
+                case "TRACE":
+                    severityRank = 0;
+                    return true;
+                case "DEBUG":
+                    severityRank = 1;
+                    return true;
+                case "INFO":
+                    severityRank = 2;
+                    return true;
+                case "WARN":
+                case "WARNING":
+                    severityRank = 3;
+                    return true;
+                case "ERROR":
+                    severityRank = 4;
+                    return true;
+                case "FATAL":
+                    severityRank = 5;
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private static List<int> BuildSearchMatchPositions(string query, string text)
@@ -931,6 +1066,22 @@ namespace Sing_box_UI
             public long Length { get; }
         }
 
+        private sealed class RenderedLogSnapshot
+        {
+            public RenderedLogSnapshot(string filteredContent, string renderedRtf, long sourceLength)
+            {
+                FilteredContent = filteredContent ?? string.Empty;
+                RenderedRtf = renderedRtf;
+                SourceLength = sourceLength;
+            }
+
+            public string FilteredContent { get; }
+
+            public string RenderedRtf { get; }
+
+            public long SourceLength { get; }
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         private struct NativePoint
         {
@@ -955,6 +1106,24 @@ namespace Sing_box_UI
             public int nPos;
 
             public int nTrackPos;
+        }
+
+        private sealed class SeverityFilterOption
+        {
+            public SeverityFilterOption(string displayText, int? minimumSeverityRank)
+            {
+                DisplayText = displayText;
+                MinimumSeverityRank = minimumSeverityRank;
+            }
+
+            public string DisplayText { get; }
+
+            public int? MinimumSeverityRank { get; }
+
+            public override string ToString()
+            {
+                return DisplayText;
+            }
         }
 
         private sealed class SeverityStyle
